@@ -109,8 +109,11 @@ func (m *Manager) SameSite(s string) {
 }
 
 // Load returns the session data for the current request.
-func (m *Manager) Load(r *http.Request) *Session {
-	return load(r, m.store, m.opts)
+func (m *Manager) LoadRequest(r *http.Request) *Session {
+	return loadRequest(r, m.store, m.opts)
+}
+func (m *Manager) Load(token string) *Session {
+	return loadToken(token, m.store, m.opts)
 }
 
 // LoadFromContext returns session data from a given context.Context object.
@@ -143,7 +146,7 @@ func (m *Manager) Multi(next http.Handler) http.Handler {
 
 func (m *Manager) Use(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		session := m.Load(r)
+		session := m.LoadRequest(r)
 
 		err := session.Touch(w)
 		if err != nil {

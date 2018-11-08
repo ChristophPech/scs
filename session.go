@@ -57,7 +57,7 @@ func newSession(store Store, opts *options) *Session {
 	}
 }
 
-func load(r *http.Request, store Store, opts *options) *Session {
+func loadRequest(r *http.Request, store Store, opts *options) *Session {
 	// Check to see if there is an already loaded session in the request context.
 	val := r.Context().Value(sessionName(opts.name))
 	if val != nil {
@@ -78,7 +78,14 @@ func load(r *http.Request, store Store, opts *options) *Session {
 	if cookie.Value == "" {
 		return newSession(store, opts)
 	}
-	token := cookie.Value
+
+	return loadToken(cookie.Value, store, opts)
+}
+
+func loadToken(token string, store Store, opts *options) *Session {
+	if len(token) < 16 {
+		return newSession(store, opts)
+	}
 
 	j, found, err := store.Find(token)
 	if err != nil {
@@ -104,7 +111,7 @@ func load(r *http.Request, store Store, opts *options) *Session {
 	return s
 }
 
-func (s *Session) write(w http.ResponseWriter) error {
+func (s *Session) write() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -128,7 +135,45 @@ func (s *Session) write(w http.ResponseWriter) error {
 		}
 	} else {
 		if s.token == "" {
-			s.token, err = generateToken()
+			s.token, err = GenerateToken()
+			if err != nil {
+				return err
+			}
+		}
+		err = s.store.Save(s.token, j, expiry)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Session) writeHttp(w http.ResponseWriter) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	j, err := encodeToJSON(s.data, s.deadline)
+	if err != nil {
+		return err
+	}
+
+	expiry := s.deadline
+	if s.opts.idleTimeout > 0 {
+		ie := time.Now().Add(s.opts.idleTimeout)
+		if ie.Before(expiry) {
+			expiry = ie
+		}
+	}
+
+	if ce, ok := s.store.(cookieStore); ok {
+		s.token, err = ce.MakeToken(j, expiry)
+		if err != nil {
+			return err
+		}
+	} else {
+		if s.token == "" {
+			s.token, err = GenerateToken()
 			if err != nil {
 				return err
 			}
@@ -173,11 +218,42 @@ func (s *Session) write(w http.ResponseWriter) error {
 	return nil
 }
 
+func (s *Session) WriteHttp(w http.ResponseWriter) error {
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+
+	return s.writeHttp(w)
+}
+
+func (s *Session) Write() error {
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+
+	return s.write()
+}
+
 // Token returns the token value that represents given session data.
 // NOTE: The method returns the empty string if session hasn't yet been written to the store.
 // If you're using the CookieStore this token will change each time the session is modified.
 func (s *Session) Token() string {
 	return s.token
+}
+
+func (s *Session) SetInitialToken(token string) error {
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.token) > 0 && s.token != token {
+		return errors.New("token_already_set")
+	}
+
+	s.token = token
+	return nil
 }
 
 // GetString returns the string value for a given key from the session data. The
@@ -202,16 +278,16 @@ func (s *Session) GetString(key string) (string, error) {
 
 // PutString adds a string value and corresponding key to the the session data.
 // Any existing value for the key will be replaced.
-func (s *Session) PutString(w http.ResponseWriter, key string, val string) error {
-	return s.put(w, key, val)
+func (s *Session) PutString(key string, val string) error {
+	return s.put(key, val)
 }
 
 // PopString removes the string value for a given key from the session data
 // and returns it. The zero value for a string ("") is returned if the key does
 // not exist. An ErrTypeAssertionFailed error is returned if the value could not
 // be type asserted to a string.
-func (s *Session) PopString(w http.ResponseWriter, key string) (string, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopString(key string) (string, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return "", err
 	}
@@ -247,16 +323,16 @@ func (s *Session) GetBool(key string) (bool, error) {
 
 // PutBool adds a bool value and corresponding key to the session data. Any existing
 // value for the key will be replaced.
-func (s *Session) PutBool(w http.ResponseWriter, key string, val bool) error {
-	return s.put(w, key, val)
+func (s *Session) PutBool(key string, val bool) error {
+	return s.put(key, val)
 }
 
 // PopBool removes the bool value for a given key from the session data and returns
 // it. The zero value for a bool (false) is returned if the key does not exist.
 // An ErrTypeAssertionFailed error is returned if the value could not be type
 // asserted to a bool.
-func (s *Session) PopBool(w http.ResponseWriter, key string) (bool, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopBool(key string) (bool, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return false, err
 	}
@@ -294,16 +370,16 @@ func (s *Session) GetInt(key string) (int, error) {
 
 // PutInt adds an int value and corresponding key to the session data. Any existing
 // value for the key will be replaced.
-func (s *Session) PutInt(w http.ResponseWriter, key string, val int) error {
-	return s.put(w, key, val)
+func (s *Session) PutInt(key string, val int) error {
+	return s.put(key, val)
 }
 
 // PopInt removes the int value for a given key from the session data and returns
 // it. The zero value for an int (0) is returned if the key does not exist. An
 // ErrTypeAssertionFailed error is returned if the value could not be type asserted
 // or converted to a int.
-func (s *Session) PopInt(w http.ResponseWriter, key string) (int, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopInt(key string) (int, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return 0, err
 	}
@@ -343,16 +419,16 @@ func (s *Session) GetInt64(key string) (int64, error) {
 
 // PutInt64 adds an int64 value and corresponding key to the session data. Any existing
 // value for the key will be replaced.
-func (s *Session) PutInt64(w http.ResponseWriter, key string, val int64) error {
-	return s.put(w, key, val)
+func (s *Session) PutInt64(key string, val int64) error {
+	return s.put(key, val)
 }
 
 // PopInt64 remvoes the int64 value for a given key from the session data
 // and returns it. The zero value for an int (0) is returned if the key does not
 // exist. An ErrTypeAssertionFailed error is returned if the value could not be
 // type asserted or converted to a int64.
-func (s *Session) PopInt64(w http.ResponseWriter, key string) (int64, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopInt64(key string) (int64, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return 0, err
 	}
@@ -393,16 +469,16 @@ func (s *Session) GetFloat(key string) (float64, error) {
 
 // PutFloat adds an float64 value and corresponding key to the session data. Any
 // existing value for the key will be replaced.
-func (s *Session) PutFloat(w http.ResponseWriter, key string, val float64) error {
-	return s.put(w, key, val)
+func (s *Session) PutFloat(key string, val float64) error {
+	return s.put(key, val)
 }
 
 // PopFloat removes the float64 value for a given key from the session data
 // and returns it. The zero value for an float (0) is returned if the key does
 // not exist. An ErrTypeAssertionFailed error is returned if the value could not
 // be type asserted or converted to a float64.
-func (s *Session) PopFloat(w http.ResponseWriter, key string) (float64, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopFloat(key string) (float64, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return 0, err
 	}
@@ -444,8 +520,8 @@ func (s *Session) GetTime(key string) (time.Time, error) {
 
 // PutTime adds an time.Time value and corresponding key to the session data. Any
 // existing value for the key will be replaced.
-func (s *Session) PutTime(w http.ResponseWriter, key string, val time.Time) error {
-	return s.put(w, key, val)
+func (s *Session) PutTime(key string, val time.Time) error {
+	return s.put(key, val)
 }
 
 // PopTime removes the time.Time value for a given key from the session data
@@ -453,8 +529,8 @@ func (s *Session) PutTime(w http.ResponseWriter, key string, val time.Time) erro
 // does not exist (this can be checked for with the time.IsZero method). An ErrTypeAssertionFailed
 // error is returned if the value could not be type asserted or converted to a
 // time.Time.
-func (s *Session) PopTime(w http.ResponseWriter, key string) (time.Time, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopTime(key string) (time.Time, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -495,20 +571,20 @@ func (s *Session) GetBytes(key string) ([]byte, error) {
 
 // PutBytes adds a byte slice ([]byte) value and corresponding key to the the
 // session data. Any existing value for the key will be replaced.
-func (s *Session) PutBytes(w http.ResponseWriter, key string, val []byte) error {
+func (s *Session) PutBytes(key string, val []byte) error {
 	if val == nil {
 		return errors.New("value must not be nil")
 	}
 
-	return s.put(w, key, val)
+	return s.put(key, val)
 }
 
 // PopBytes removes the byte slice ([]byte) value for a given key from the session
 // data and returns it. The zero value for a slice (nil) is returned if the key
 // does not exist. An ErrTypeAssertionFailed error is returned if the value could
 // not be type asserted or converted to a []byte.
-func (s *Session) PopBytes(w http.ResponseWriter, key string) ([]byte, error) {
-	v, exists, err := s.pop(w, key)
+func (s *Session) PopBytes(key string) ([]byte, error) {
+	v, exists, err := s.pop(key)
 	if err != nil {
 		return nil, err
 	}
@@ -556,7 +632,7 @@ func (s *Session) GetObject(key string, dst interface{}) error {
 // Because gob encoding is used, the fields on custom types must be exported in
 // order to be persisted correctly. Custom data types must also be registered with
 // gob.Register before PutObject is called (see https://golang.org/pkg/encoding/gob/#Register).
-func (s *Session) PutObject(w http.ResponseWriter, key string, val interface{}) error {
+func (s *Session) PutObject(key string, val interface{}) error {
 	if val == nil {
 		return errors.New("value must not be nil")
 	}
@@ -566,7 +642,7 @@ func (s *Session) PutObject(w http.ResponseWriter, key string, val interface{}) 
 		return err
 	}
 
-	return s.PutBytes(w, key, b)
+	return s.PutBytes(key, b)
 }
 
 // PopObject removes the data for a given session key and reads it into a custom
@@ -575,8 +651,8 @@ func (s *Session) PutObject(w http.ResponseWriter, key string, val interface{}) 
 // by dst will remain unchanged if the key does not exist.
 //
 // The dst parameter must be a pointer.
-func (s *Session) PopObject(w http.ResponseWriter, key string, dst interface{}) error {
-	b, err := s.PopBytes(w, key)
+func (s *Session) PopObject(key string, dst interface{}) error {
+	b, err := s.PopBytes(key)
 	if err != nil {
 		return err
 	}
@@ -624,7 +700,7 @@ func (s *Session) Exists(key string) (bool, error) {
 
 // Remove deletes the given key and corresponding value from the session data.
 // If the key is not present this operation is a no-op.
-func (s *Session) Remove(w http.ResponseWriter, key string) error {
+func (s *Session) Remove(key string) error {
 	if s.loadErr != nil {
 		return s.loadErr
 	}
@@ -640,13 +716,13 @@ func (s *Session) Remove(w http.ResponseWriter, key string) error {
 	delete(s.data, key)
 	s.mu.Unlock()
 
-	return s.write(w)
+	return nil
 }
 
 // Clear removes all data for the current session. The session token and lifetime
 // are unaffected. If there is no data in the current session this operation is
 // a no-op.
-func (s *Session) Clear(w http.ResponseWriter) error {
+func (s *Session) Clear() error {
 	if s.loadErr != nil {
 		return s.loadErr
 	}
@@ -663,7 +739,7 @@ func (s *Session) Clear(w http.ResponseWriter) error {
 	}
 	s.mu.Unlock()
 
-	return s.write(w)
+	return nil
 }
 
 // RenewToken creates a new session token while retaining the current session
@@ -675,7 +751,7 @@ func (s *Session) Clear(w http.ResponseWriter) error {
 // RenewToken before making any changes to privilege levels (e.g. login and
 // logout operations). See https://www.owasp.org/index.php/Session_fixation for
 // additional information.
-func (s *Session) RenewToken(w http.ResponseWriter) error {
+func (s *Session) RenewToken() error {
 	if s.loadErr != nil {
 		return s.loadErr
 	}
@@ -688,7 +764,7 @@ func (s *Session) RenewToken(w http.ResponseWriter) error {
 		return err
 	}
 
-	token, err := generateToken()
+	token, err := GenerateToken()
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -698,7 +774,7 @@ func (s *Session) RenewToken(w http.ResponseWriter) error {
 	s.deadline = time.Now().Add(s.opts.lifetime)
 	s.mu.Unlock()
 
-	return s.write(w)
+	return nil
 }
 
 // Destroy deletes the current session. The session token and accompanying
@@ -750,7 +826,7 @@ func (s *Session) Touch(w http.ResponseWriter) error {
 		return s.loadErr
 	}
 	if s.opts.idleTimeout > 0 {
-		return s.write(w)
+		return s.writeHttp(w)
 	}
 	return nil
 }
@@ -767,7 +843,7 @@ func (s *Session) get(key string) (interface{}, bool, error) {
 	return v, exists, nil
 }
 
-func (s *Session) put(w http.ResponseWriter, key string, val interface{}) error {
+func (s *Session) put(key string, val interface{}) error {
 	if s.loadErr != nil {
 		return s.loadErr
 	}
@@ -776,10 +852,10 @@ func (s *Session) put(w http.ResponseWriter, key string, val interface{}) error 
 	s.data[key] = val
 	s.mu.Unlock()
 
-	return s.write(w)
+	return nil
 }
 
-func (s *Session) pop(w http.ResponseWriter, key string) (interface{}, bool, error) {
+func (s *Session) pop(key string) (interface{}, bool, error) {
 	if s.loadErr != nil {
 		return nil, false, s.loadErr
 	}
@@ -795,15 +871,10 @@ func (s *Session) pop(w http.ResponseWriter, key string) (interface{}, bool, err
 	delete(s.data, key)
 	s.mu.Unlock()
 
-	err := s.write(w)
-	if err != nil {
-		return nil, false, err
-	}
-
 	return v, true, nil
 }
 
-func generateToken() (string, error) {
+func GenerateToken() (string, error) {
 	b := make([]byte, 32)
 	_, err := rand.Read(b)
 	if err != nil {
